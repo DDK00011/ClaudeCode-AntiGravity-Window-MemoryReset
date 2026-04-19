@@ -754,6 +754,7 @@ function Invoke-ShellRestart {
 function Write-RecoveryLog {
     param(
         [string]$Mode,
+        [int]$TotalMB,
         [int]$BeforeFreeMB,
         [int]$AfterFreeMB,
         [double]$BeforePctFree,
@@ -765,28 +766,78 @@ function Write-RecoveryLog {
     $logPath = Join-Path $PSScriptRoot 'recovery-history.csv'
     $isNew   = -not (Test-Path $logPath)
 
+    # 컬럼 의미 명확화:
+    #   Used* = 사용 메모리 (메모리 사용량)
+    #   Free* = 가용 메모리 (회수 후 늘어나는 값)
+    #   FreedMB = 회수된 양 = UsedBefore - UsedAfter (= AfterFree - BeforeFree, 양수면 회수 성공)
+    $usedBefore = $TotalMB - $BeforeFreeMB
+    $usedAfter  = $TotalMB - $AfterFreeMB
+
     $row = [PSCustomObject]@{
         Timestamp        = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
         Mode             = $Mode
+        TotalMB          = $TotalMB
+        UsedBeforeMB     = $usedBefore
+        UsedAfterMB      = $usedAfter
+        FreedMB          = $usedBefore - $usedAfter      # 양수 = 회수 성공
         BeforeFreeMB     = $BeforeFreeMB
         AfterFreeMB      = $AfterFreeMB
-        RecoveredMB      = $AfterFreeMB - $BeforeFreeMB
         BeforePctFree    = $BeforePctFree
         AfterPctFree     = $AfterPctFree
-        RecoveredPctP    = [math]::Round($AfterPctFree - $BeforePctFree, 2)
+        FreedPctP        = [math]::Round($AfterPctFree - $BeforePctFree, 2)  # 가용 % 증가폭 (+면 회수)
         ProcessesKilled  = $ProcessesKilled
         RuntimeSec       = [math]::Round($RuntimeSec, 1)
     }
 
-    try {
-        if ($isNew) {
-            $row | Export-Csv -Path $logPath -NoTypeInformation -Encoding UTF8
-        } else {
-            $row | Export-Csv -Path $logPath -NoTypeInformation -Encoding UTF8 -Append
+    # CSV 파일 락 (Excel 등으로 열려 있는 경우) 대응 — 최대 3회 재시도 + fallback 파일
+    $maxRetry = 3
+    for ($attempt = 1; $attempt -le $maxRetry; $attempt++) {
+        try {
+            if ($isNew) {
+                $row | Export-Csv -Path $logPath -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+            } else {
+                $row | Export-Csv -Path $logPath -NoTypeInformation -Encoding UTF8 -Append -ErrorAction Stop
+            }
+            return  # 성공
+        } catch {
+            if ($attempt -lt $maxRetry) {
+                Start-Sleep -Milliseconds (300 * $attempt)  # 점진 backoff
+            } else {
+                # 최종 실패 — 일자별 fallback 파일에 append (동시초 충돌 방지)
+                # Filename: recovery-history-fallback-YYYYMMDD.csv  → 같은 날 fallback 은 모두 한 파일에 누적
+                Write-Host " [!] CSV 로그 기록 실패 (락 또는 권한): $($_.Exception.Message)" -ForegroundColor DarkYellow
+                $fallbackName = 'recovery-history-fallback-' + (Get-Date -Format 'yyyyMMdd') + '.csv'
+                $fallback = Join-Path (Split-Path $logPath -Parent) $fallbackName
+                $fallbackIsNew = -not (Test-Path $fallback)
+                # fallback 도 락 가능 — 짧은 재시도
+                $fbOk = $false
+                for ($fbAttempt = 1; $fbAttempt -le 3; $fbAttempt++) {
+                    try {
+                        if ($fallbackIsNew) {
+                            $row | Export-Csv -Path $fallback -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+                        } else {
+                            $row | Export-Csv -Path $fallback -NoTypeInformation -Encoding UTF8 -Append -ErrorAction Stop
+                        }
+                        $fbOk = $true
+                        break
+                    } catch {
+                        Start-Sleep -Milliseconds (200 * $fbAttempt)
+                    }
+                }
+                if ($fbOk) {
+                    Write-Host (" [i] 대체 파일에 기록: {0}" -f (Split-Path $fallback -Leaf)) -ForegroundColor DarkGray
+                } else {
+                    # 마지막 수단: 고유 GUID 파일명 (충돌 절대 회피, 재구성 시 합치면 됨)
+                    $unique = Join-Path (Split-Path $logPath -Parent) ('recovery-history-emergency-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' + ([Guid]::NewGuid().ToString('N').Substring(0,4)) + '.csv')
+                    try {
+                        $row | Export-Csv -Path $unique -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+                        Write-Host (" [i] 비상 파일에 기록: {0}" -f (Split-Path $unique -Leaf)) -ForegroundColor DarkGray
+                    } catch {
+                        Write-Host " [!] 모든 기록 시도 실패 (CSV 로그 누락)" -ForegroundColor DarkYellow
+                    }
+                }
+            }
         }
-    } catch {
-        # 로깅 실패는 회수 자체에 영향 없음 — 조용히 경고만
-        Write-Host " [!] CSV 로그 기록 실패: $($_.Exception.Message)" -ForegroundColor DarkYellow
     }
 }
 
@@ -913,6 +964,7 @@ if (-not $DryRun) {
     $elapsed = ((Get-Date) - $script:startTime).TotalSeconds
     Write-RecoveryLog `
         -Mode             $modeTag `
+        -TotalMB          $before.TotalMB `
         -BeforeFreeMB     $before.FreeMB `
         -AfterFreeMB      $after.FreeMB `
         -BeforePctFree    $before.PctFree `

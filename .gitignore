@@ -1,14 +1,23 @@
-# Logs
-*.log
+﻿# ── Personal data / runtime state (never commit) ──
+*.csv                      # 회수 이력 (recovery-history.csv 등 모든 CSV)
+tray-settings.json         # 사용자 임계치/폴링 설정
+tray-state.json            # 마지막 알림 시각 등 런타임 상태
+recovery-history.*         # 백업/롤오버 변형 모두
+*.log                      # tray 데몬 디버그 로그 등 모든 로그
+
+# Backups
 *.txt.bak
-recovery-history.csv
+*.json.bak
 
 # Local config / secrets
 .env
 .env.local
+.env.*
 secrets/
 *.pfx
 *.key
+*.pem
+credentials*
 
 # Windows artifacts
 Thumbs.db

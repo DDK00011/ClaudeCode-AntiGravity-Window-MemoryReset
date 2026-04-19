@@ -131,3 +131,102 @@ if ($src -match 'Start-Sleep\s+-Milliseconds\s+1500') {
 } else {
     Write-Host "[WARN] MMAgent sleep 1500ms 미확인" -ForegroundColor Yellow
 }
+
+# v1.2 신규 기능 smoke test
+Write-Host ""
+Write-Host "== v1.2 트레이/CSV smoke test =="
+
+# 8. CSV 로깅 함수 존재
+if ($src -match '(?ms)^function\s+Write-RecoveryLog\b') {
+    Write-Host "[PASS] CSV 로깅 함수 정의: Write-RecoveryLog" -ForegroundColor Green
+} else {
+    Write-Host "[FAIL] Write-RecoveryLog 함수 누락" -ForegroundColor Red
+}
+
+# 9. CSV 락/재시도 가드
+if ($src -match 'maxRetry\s*=\s*3' -and $src -match 'fallback') {
+    Write-Host "[PASS] CSV 파일 락 재시도 + fallback 가드 존재" -ForegroundColor Green
+} else {
+    Write-Host "[WARN] CSV 락 가드 미확인" -ForegroundColor Yellow
+}
+
+# 10. 트레이 데몬 파일 존재 + smoke check
+$trayPath = Join-Path $PSScriptRoot 'MemoryReset-Tray.ps1'
+if (Test-Path $trayPath) {
+    Write-Host "[PASS] MemoryReset-Tray.ps1 파일 존재" -ForegroundColor Green
+    $trayContent = Get-Content $trayPath -Raw -Encoding UTF8
+
+    # 10-1. P0 수정 검증: Add-Type 이 mutex 검사보다 먼저
+    $addTypeIdx = $trayContent.IndexOf("Add-Type -AssemblyName System.Windows.Forms")
+    $mutexIdx   = $trayContent.IndexOf("New-Object System.Threading.Mutex")
+    if ($addTypeIdx -gt 0 -and $mutexIdx -gt 0 -and $addTypeIdx -lt $mutexIdx) {
+        Write-Host "[PASS] Tray Add-Type 이 mutex 검사 이전에 실행" -ForegroundColor Green
+    } else {
+        Write-Host "[FAIL] Tray Add-Type 순서 오류 — 두번째 인스턴스 시 MessageBox 실패 가능" -ForegroundColor Red
+    }
+
+    # 10-2. mutex Local\ scope (Global\ 권한 이슈 회피)
+    if ($trayContent.Contains("'Local\MemoryReset-Tray-Singleton'")) {
+        Write-Host "[PASS] Tray mutex Local\ scope (사용자 세션)" -ForegroundColor Green
+    } elseif ($trayContent.Contains("'Global\MemoryReset-Tray-Singleton'")) {
+        Write-Host "[WARN] Tray mutex Global\ — 권한 이슈 가능, Local\ 권장" -ForegroundColor Yellow
+    } else {
+        Write-Host "[WARN] Tray mutex naming 미확인" -ForegroundColor Yellow
+    }
+
+    # 10-3. Tick 함수 분리 (reflection 의존성 제거)
+    if ($trayContent -match '(?ms)^function\s+Invoke-MemoryTick\b') {
+        Write-Host "[PASS] Tray Invoke-MemoryTick 함수 분리 (reflection 미의존)" -ForegroundColor Green
+    } else {
+        Write-Host "[WARN] Tick 함수 분리 미확인" -ForegroundColor Yellow
+    }
+
+    # 10-4. 디버그 로그 헬퍼
+    if ($trayContent -match '(?ms)^function\s+Write-TrayLog\b') {
+        Write-Host "[PASS] Tray 디버그 로그 헬퍼 존재 (silent failure 추적 가능)" -ForegroundColor Green
+    } else {
+        Write-Host "[WARN] Write-TrayLog 미확인 — silent failure 추적 어려움" -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "[FAIL] MemoryReset-Tray.ps1 파일 없음" -ForegroundColor Red
+}
+
+# 11. .gitignore 개인 데이터 보호
+$gitignorePath = Join-Path $PSScriptRoot '.gitignore'
+if (Test-Path $gitignorePath) {
+    $gi = Get-Content $gitignorePath -Raw
+    if ($gi -match '\*\.csv' -and $gi -match 'tray-settings') {
+        Write-Host "[PASS] .gitignore 가 *.csv + tray-settings.json 보호" -ForegroundColor Green
+    } else {
+        Write-Host "[WARN] .gitignore 개인 데이터 패턴 미확인" -ForegroundColor Yellow
+    }
+}
+
+# v1.2.1 Round 2 패치 검증
+Write-Host ""
+Write-Host "== v1.2.1 Round 2 패치 검증 =="
+
+# 12. STA 명시 (Tray.bat)
+$trayBat = Join-Path $PSScriptRoot 'Tray.bat'
+if (Test-Path $trayBat) {
+    $batContent = Get-Content $trayBat -Raw
+    if ($batContent -match '-Sta\b') {
+        Write-Host "[PASS] Tray.bat 가 -Sta 플래그 명시 (WinForms 호환성)" -ForegroundColor Green
+    } else {
+        Write-Host "[WARN] Tray.bat -Sta 미확인 — MTA 환경에서 InputBox 등 hang 가능" -ForegroundColor Yellow
+    }
+}
+
+# 13. CSV 컬럼명 명확화: FreedMB / UsedBeforeMB / UsedAfterMB
+if ($src -match 'UsedBeforeMB' -and $src -match 'FreedMB') {
+    Write-Host "[PASS] CSV 스키마 명확 (UsedBefore/UsedAfter/FreedMB)" -ForegroundColor Green
+} else {
+    Write-Host "[WARN] CSV 컬럼명 명확화 미확인" -ForegroundColor Yellow
+}
+
+# 14. fallback 파일 동시초 충돌 방지 (일자 단위 통합 + GUID emergency)
+if ($src -match 'recovery-history-fallback-' -and $src -match 'recovery-history-emergency-') {
+    Write-Host "[PASS] CSV fallback 동시초 충돌 방지 (일자 통합 + GUID 비상)" -ForegroundColor Green
+} else {
+    Write-Host "[WARN] CSV fallback 충돌 방지 미확인" -ForegroundColor Yellow
+}

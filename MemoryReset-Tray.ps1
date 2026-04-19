@@ -23,10 +23,20 @@
 param()
 
 # ════════════════════════════════════════════════════════════════════
-# 1. 단일 인스턴스 mutex
+# 1. 어셈블리 로드 (mutex 검사 전에 미리 — MessageBox 사용 가능하도록)
+# ════════════════════════════════════════════════════════════════════
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName Microsoft.VisualBasic   # InputBox
+[System.Windows.Forms.Application]::EnableVisualStyles()
+[System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
+
+# ════════════════════════════════════════════════════════════════════
+# 2. 단일 인스턴스 mutex
+#    Local\ scope (사용자 세션) — Global\ 은 권한 이슈 가능
 # ════════════════════════════════════════════════════════════════════
 $createdNew = $false
-$mutex = New-Object System.Threading.Mutex($false, 'Global\MemoryReset-Tray-Singleton', [ref]$createdNew)
+$mutex = New-Object System.Threading.Mutex($false, 'Local\MemoryReset-Tray-Singleton', [ref]$createdNew)
 if (-not $createdNew) {
     [System.Windows.Forms.MessageBox]::Show(
         "Memory Reset Tray 가 이미 실행 중입니다.`n시스템 트레이 (시계 옆) 의 메모리 아이콘을 확인하세요.",
@@ -38,20 +48,25 @@ if (-not $createdNew) {
 }
 
 # ════════════════════════════════════════════════════════════════════
-# 2. 어셈블리 로드
-# ════════════════════════════════════════════════════════════════════
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-[System.Windows.Forms.Application]::EnableVisualStyles()
-[System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
-
-# ════════════════════════════════════════════════════════════════════
 # 3. 설정 (tray-settings.json)
 # ════════════════════════════════════════════════════════════════════
-$script:scriptDir   = $PSScriptRoot
-$script:mainScript  = Join-Path $scriptDir 'MemoryReset.ps1'
+$script:scriptDir    = $PSScriptRoot
+$script:mainScript   = Join-Path $scriptDir 'MemoryReset.ps1'
 $script:settingsPath = Join-Path $scriptDir 'tray-settings.json'
 $script:historyPath  = Join-Path $scriptDir 'recovery-history.csv'
+$script:logPath      = Join-Path $scriptDir 'tray-debug.log'
+
+# 디버그 로그 헬퍼 (Tray 데몬은 콘솔이 숨겨져 있어 silent failure 추적 어려움 — 파일로 남김)
+function Write-TrayLog {
+    param([string]$Message, [string]$Level = 'INFO')
+    try {
+        $line = "{0} [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
+        Add-Content -Path $script:logPath -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue
+    } catch {
+        # 로그 실패는 무시 (런타임에 영향 없음)
+    }
+}
+Write-TrayLog "트레이 데몬 시작 (PID=$PID)"
 
 $defaultSettings = @{
     AlertThresholdPct = 90    # 알림 발동 메모리 사용률
@@ -216,56 +231,71 @@ $icon.ContextMenuStrip = $menu
 # 좌클릭 시 빠른 회수 메뉴 표시 (DoubleClick 으로 변경 가능)
 $icon.Add_MouseClick({
     if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
-        # NotifyIcon 의 ShowContextMenu 는 private 이라 우회
-        $methodInfo = [System.Windows.Forms.NotifyIcon].GetMethod(
-            'ShowContextMenu',
-            [System.Reflection.BindingFlags]'Instance, NonPublic'
-        )
-        if ($methodInfo) { $methodInfo.Invoke($icon, $null) }
+        # NotifyIcon 의 ShowContextMenu 는 private 메서드 — reflection 우회 (PS 5.1+ 검증됨)
+        try {
+            $methodInfo = [System.Windows.Forms.NotifyIcon].GetMethod(
+                'ShowContextMenu',
+                [System.Reflection.BindingFlags]'Instance, NonPublic'
+            )
+            if ($methodInfo) {
+                $methodInfo.Invoke($icon, $null)
+            } else {
+                # reflection 실패 시 fallback: 메뉴 직접 표시 (커서 위치)
+                $icon.ContextMenuStrip.Show([System.Windows.Forms.Cursor]::Position)
+            }
+        } catch {
+            Write-TrayLog "좌클릭 메뉴 표시 실패: $($_.Exception.Message)" 'WARN'
+            try { $icon.ContextMenuStrip.Show([System.Windows.Forms.Cursor]::Position) } catch {}
+        }
     }
 })
-
-# Microsoft.VisualBasic.Interaction (InputBox) 어셈블리
-Add-Type -AssemblyName Microsoft.VisualBasic
 
 # ════════════════════════════════════════════════════════════════════
 # 6. 폴링 타이머 — 메모리 체크 + 임계치 알림
 # ════════════════════════════════════════════════════════════════════
 $script:lastAlert = $null
 
+# Tick 로직을 명명 함수로 분리 — 즉시 호출 + 타이머 모두 동일 코드 사용 (reflection 의존성 제거)
+function Invoke-MemoryTick {
+    try {
+        $m = Get-MemoryUsage
+        if ($null -eq $m) {
+            Write-TrayLog "Get-MemoryUsage returned null (CIM 접근 실패?)" 'WARN'
+            return
+        }
+
+        # 툴팁 업데이트 (NotifyIcon.Text 는 최대 63자 — Windows API 제한)
+        $tooltip = "Memory: {0}% used ({1}/{2} GB)" -f $m.UsedPct, [math]::Round($m.UsedMB/1024,1), [math]::Round($m.TotalMB/1024,1)
+        if ($tooltip.Length -gt 63) { $tooltip = $tooltip.Substring(0, 63) }
+        $icon.Text = $tooltip
+
+        # 메뉴 헤더 업데이트
+        $mnuStatus.Text = (" 사용 {0}% / 가용 {1:N0} MB" -f $m.UsedPct, $m.FreeMB)
+
+        # 임계치 알림 (쿨다운 적용)
+        if ($m.UsedPct -ge $script:settings.AlertThresholdPct) {
+            $now = Get-Date
+            $shouldAlert = ($null -eq $script:lastAlert) -or
+                           (($now - $script:lastAlert).TotalMinutes -ge $script:settings.AlertCooldownMin)
+            if ($shouldAlert) {
+                $msg = "메모리 사용률 {0}% 도달.`n트레이 아이콘 우클릭 → '깊은 회수 (Deep)' 권장." -f $m.UsedPct
+                $icon.ShowBalloonTip(8000, "메모리 임계치 알림", $msg, [System.Windows.Forms.ToolTipIcon]::Warning)
+                $script:lastAlert = $now
+                Write-TrayLog ("임계치 알림 발동: {0}% (임계치 {1}%)" -f $m.UsedPct, $script:settings.AlertThresholdPct)
+            }
+        }
+    } catch {
+        Write-TrayLog "Tick 처리 실패: $($_.Exception.Message)" 'ERROR'
+    }
+}
+
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = $script:settings.CheckIntervalSec * 1000
-$timer.Add_Tick({
-    $m = Get-MemoryUsage
-    if ($null -eq $m) { return }
-
-    # 툴팁 업데이트 (NotifyIcon.Text 는 최대 63자 — Windows API 제한)
-    $tooltip = "Memory: {0}% used ({1}/{2} GB)" -f $m.UsedPct, [math]::Round($m.UsedMB/1024,1), [math]::Round($m.TotalMB/1024,1)
-    if ($tooltip.Length -gt 63) { $tooltip = $tooltip.Substring(0, 63) }
-    $icon.Text = $tooltip
-
-    # 메뉴 헤더 업데이트
-    $mnuStatus.Text = (" 사용 {0}% / 가용 {1:N0} MB" -f $m.UsedPct, $m.FreeMB)
-
-    # 임계치 알림 (쿨다운 적용)
-    if ($m.UsedPct -ge $script:settings.AlertThresholdPct) {
-        $now = Get-Date
-        $shouldAlert = ($null -eq $script:lastAlert) -or
-                       (($now - $script:lastAlert).TotalMinutes -ge $script:settings.AlertCooldownMin)
-        if ($shouldAlert) {
-            $msg = "메모리 사용률 {0}% 도달.`n트레이 아이콘 우클릭 → '깊은 회수 (Deep)' 권장." -f $m.UsedPct
-            $icon.ShowBalloonTip(8000, "메모리 임계치 알림", $msg, [System.Windows.Forms.ToolTipIcon]::Warning)
-            $script:lastAlert = $now
-        }
-    }
-})
+$timer.Add_Tick({ Invoke-MemoryTick })
 $timer.Start()
 
-# 즉시 1회 측정 (대기 없이 첫 표시)
-$timer_TickInvoke = $timer.GetType().GetMethod('OnTick', [System.Reflection.BindingFlags]'Instance, NonPublic')
-if ($timer_TickInvoke) {
-    try { $timer_TickInvoke.Invoke($timer, @([System.EventArgs]::Empty)) } catch {}
-}
+# 즉시 1회 측정 (사용자가 30초 기다리지 않도록)
+Invoke-MemoryTick
 
 # ════════════════════════════════════════════════════════════════════
 # 7. 시작 알림 + 메시지 루프
@@ -276,11 +306,19 @@ $icon.ShowBalloonTip(3000,
     [System.Windows.Forms.ToolTipIcon]::Info)
 
 try {
+    Write-TrayLog "메시지 루프 진입"
     [System.Windows.Forms.Application]::Run()
+} catch {
+    Write-TrayLog "메시지 루프 예외: $($_.Exception.Message)" 'ERROR'
 } finally {
-    $timer.Stop()
-    $timer.Dispose()
-    if ($icon.Visible) { $icon.Visible = $false }
-    $icon.Dispose()
-    if ($mutex) { $mutex.ReleaseMutex(); $mutex.Dispose() }
+    Write-TrayLog "트레이 데몬 종료 (정리 시작)"
+    try { $timer.Stop()    } catch {}
+    try { $timer.Dispose() } catch {}
+    if ($icon -and $icon.Visible) { $icon.Visible = $false }
+    try { $icon.Dispose()  } catch {}
+    if ($mutex) {
+        try { $mutex.ReleaseMutex() } catch {}
+        try { $mutex.Dispose()      } catch {}
+    }
+    Write-TrayLog "트레이 데몬 정리 완료"
 }
