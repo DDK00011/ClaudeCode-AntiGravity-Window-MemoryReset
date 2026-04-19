@@ -48,7 +48,8 @@
     .\MemoryReset.ps1 -SkipConfirmation -KeepAlive        # 자동화
 
 .NOTES
-    관리자 권한 필요 (-DryRun / -Diagnose 제외). 미보유 시 자동 elevation 시도.
+    관리자 권한 항상 필요 (모든 모드). 미보유 시 자동 UAC 승격 시도.
+    [v1.1.2 변경] DryRun / Diagnose 도 UAC 강제 — 보호 프로세스 정확 측정 + 보안 가시성.
 #>
 
 [CmdletBinding()]
@@ -77,27 +78,29 @@ function Test-IsAdmin {
 }
 
 if (-not (Test-IsAdmin)) {
-    if ($DryRun -or $Diagnose) {
-        # DryRun / Diagnose 는 read-only → 관리자 권한 불필요, 그대로 진행
-        Write-Host "[i] 읽기 전용 모드: 관리자 권한 없이 진행" -ForegroundColor DarkGray
-    } else {
-        Write-Host "[!] 관리자 권한이 필요합니다. UAC 승격을 시도합니다..." -ForegroundColor Yellow
-        $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
-        if ($SkipConfirmation)  { $argList += '-SkipConfirmation' }
-        if ($KeepAlive)         { $argList += '-KeepAlive' }
-        if ($Deep)              { $argList += '-Deep' }
-        if ($IncludeShell)      { $argList += '-IncludeShell' }
-        if ($PSBoundParameters.ContainsKey('GracefulTimeoutSec')) {
-            $argList += @('-GracefulTimeoutSec', $GracefulTimeoutSec)
-        }
-        try {
-            Start-Process powershell.exe -Verb RunAs -ArgumentList $argList -ErrorAction Stop
-        } catch {
-            Write-Host "[X] 승격 실패: $_" -ForegroundColor Red
-            exit 1
-        }
-        exit 0
+    # v1.1.2: 사용자 요청에 따라 UAC 항상 강제 (DryRun / Diagnose 도 admin 권한 사용)
+    # 이유:
+    #   - Diagnose 가 "Memory Compression" 프로세스 enumerate / 다른 사용자 프로세스 조회 가능
+    #   - DryRun 이 보호 프로세스의 정확한 메모리 측정 가능
+    #   - 사용자가 매 실행 시 UAC 확인 (보안 가시성)
+    Write-Host "[!] 관리자 권한이 필요합니다. UAC 승격을 시도합니다..." -ForegroundColor Yellow
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
+    if ($DryRun)            { $argList += '-DryRun' }
+    if ($SkipConfirmation)  { $argList += '-SkipConfirmation' }
+    if ($KeepAlive)         { $argList += '-KeepAlive' }
+    if ($Deep)              { $argList += '-Deep' }
+    if ($IncludeShell)      { $argList += '-IncludeShell' }
+    if ($Diagnose)          { $argList += '-Diagnose' }
+    if ($PSBoundParameters.ContainsKey('GracefulTimeoutSec')) {
+        $argList += @('-GracefulTimeoutSec', $GracefulTimeoutSec)
     }
+    try {
+        Start-Process powershell.exe -Verb RunAs -ArgumentList $argList -ErrorAction Stop
+    } catch {
+        Write-Host "[X] 승격 실패: $_" -ForegroundColor Red
+        exit 1
+    }
+    exit 0
 }
 
 # IncludeShell 은 Deep 없이는 무의미 — 자동 활성화
