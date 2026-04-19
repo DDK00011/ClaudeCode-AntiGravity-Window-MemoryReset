@@ -61,6 +61,12 @@ Run-DryRun.bat
 
 :: 2. 본 실행 (UAC 프롬프트 → 승인)
 Run.bat
+
+:: 3. 깊은 회수 [v1.1+] — Memory Compression flush + System WS + 네트워크 캐시
+Run-Deep.bat
+
+:: 진단만 [v1.1+] (UAC 불필요) — 메모리 분포/상위 점유 프로세스 보기
+Run-Diagnose.bat
 ```
 
 또는 PowerShell 에서 직접:
@@ -69,19 +75,40 @@ Run.bat
 # 일반 실행
 .\MemoryReset.ps1
 
-# 자동화/스케줄러용
-.\MemoryReset.ps1 -SkipConfirmation -KeepAlive
+# 깊은 회수 — 재부팅과의 격차 최소화
+.\MemoryReset.ps1 -Deep
 
-# 옵션
-.\MemoryReset.ps1 -GracefulTimeoutSec 12 -DryRun
+# 최대 회수 — Tier A + 셸 재시작 (데스크톱 1~2초 깜빡임)
+.\MemoryReset.ps1 -Deep -IncludeShell
+
+# 자동화/스케줄러용
+.\MemoryReset.ps1 -Deep -SkipConfirmation -KeepAlive
+
+# 진단만
+.\MemoryReset.ps1 -Diagnose
 ```
 
 | 옵션 | 의미 | 기본값 |
 |------|------|--------|
 | `-GracefulTimeoutSec <n>` | CloseMainWindow 후 대기 (초) | `8` |
 | `-DryRun` | 종료/회수 없이 대상만 표시 (UAC 불필요) | off |
+| `-Deep` | **[v1.1+]** Memory Compression flush + System WS empty + DNS/NetBIOS/ARP 캐시 | off |
+| `-IncludeShell` | **[v1.1+]** Explorer + Windows Search 재시작 (`-Deep` 자동 활성) | off |
+| `-Diagnose` | **[v1.1+]** 메모리 분포 진단만 (UAC 불필요) | off |
 | `-SkipConfirmation` | Y/n 프롬프트 생략 | off |
 | `-KeepAlive` | 완료 후 키 입력 대기 없이 즉시 종료 | off |
+
+#### 모드별 권장 시나리오
+
+| 상황 | 권장 명령 |
+|------|-----------|
+| 일반적인 메모리 회복 | `Run.bat` |
+| 며칠간 켜둔 PC 의 누적 캐시까지 정리 | `Run-Deep.bat` |
+| 재부팅 직전까지 짜낸 듯한 경험 원할 때 | `MemoryReset.ps1 -Deep -IncludeShell` |
+| 회수 전 무엇이 점유 중인지 보기 | `Run-Diagnose.bat` |
+| 어떤 프로세스가 종료될지만 미리 보기 | `Run-DryRun.bat` |
+
+> **참고**: Memory Compression Store 와 Standby List 는 며칠간 켜둔 PC 에서 수 GB까지 누적될 수 있습니다. `-Deep` 은 이 둘을 모두 flush 해서 재부팅과의 격차를 좁힙니다. 단, 커널 pool / GPU 드라이버 / 페이지 파일 영역의 누수는 본질적으로 재부팅이 필요합니다 (주간 1회 권장).
 
 ### 종료 대상 식별 규칙
 
@@ -180,19 +207,40 @@ Or directly via PowerShell:
 # Interactive
 .\MemoryReset.ps1
 
-# Automation / scheduler
-.\MemoryReset.ps1 -SkipConfirmation -KeepAlive
+# Deep recovery — narrows the gap with a fresh reboot
+.\MemoryReset.ps1 -Deep
 
-# Custom graceful timeout + dry-run
-.\MemoryReset.ps1 -GracefulTimeoutSec 12 -DryRun
+# Maximum recovery — Tier A + shell restart (desktop briefly flickers)
+.\MemoryReset.ps1 -Deep -IncludeShell
+
+# Automation / scheduler
+.\MemoryReset.ps1 -Deep -SkipConfirmation -KeepAlive
+
+# Diagnostics only (no UAC required)
+.\MemoryReset.ps1 -Diagnose
 ```
 
 | Option | Meaning | Default |
 |--------|---------|---------|
 | `-GracefulTimeoutSec <n>` | Wait time after `CloseMainWindow` (seconds) | `8` |
 | `-DryRun` | List targets only, no termination/recovery (no UAC needed) | off |
+| `-Deep` | **[v1.1+]** Memory Compression flush + System WS empty + DNS/NetBIOS/ARP cache | off |
+| `-IncludeShell` | **[v1.1+]** Restart Explorer + Windows Search (auto-implies `-Deep`) | off |
+| `-Diagnose` | **[v1.1+]** Memory distribution analysis only (no UAC needed) | off |
 | `-SkipConfirmation` | Skip Y/n prompt | off |
 | `-KeepAlive` | Exit immediately on completion (no keypress wait) | off |
+
+#### Mode recommendations
+
+| Situation | Recommended command |
+|-----------|---------------------|
+| Routine memory recovery | `Run.bat` |
+| Cumulative caches after days of uptime | `Run-Deep.bat` |
+| Want a near-reboot experience | `MemoryReset.ps1 -Deep -IncludeShell` |
+| See what is currently holding memory | `Run-Diagnose.bat` |
+| Preview which processes will be terminated | `Run-DryRun.bat` |
+
+> **Note**: Memory Compression Store and Standby List can accumulate several GB on a system that has been on for days. `-Deep` flushes both, narrowing the gap with a reboot. Kernel pool / GPU driver / page file fragmentation is fundamentally only fixable by reboot — a weekly reboot is still recommended.
 
 ### Requirements
 

@@ -27,13 +27,28 @@
 .PARAMETER KeepAlive
     완료 후 키 입력 대기 없이 즉시 종료.
 
+.PARAMETER Deep
+    [v1.1+] Tier A 추가 회수 — Memory Compression Store flush + System Working Set empty + 네트워크 캐시 정리.
+    재부팅과의 차이를 좁히기 위한 안전한 추가 단계.
+
+.PARAMETER IncludeShell
+    [v1.1+] Tier B 추가 — Explorer.exe + Windows Search 서비스 재시작.
+    데스크톱이 1~2초 깜빡이며 열린 탐색기 창이 닫힘. -Deep 와 함께 사용.
+
+.PARAMETER Diagnose
+    [v1.1+] 회수 없이 진단만 수행 — 메모리 리스트 분포, 압축 store, 상위 점유 프로세스 표시.
+    UAC 불필요.
+
 .EXAMPLE
-    .\MemoryReset.ps1
-    .\MemoryReset.ps1 -DryRun
-    .\MemoryReset.ps1 -SkipConfirmation -KeepAlive
+    .\MemoryReset.ps1                                     # 기본 회수
+    .\MemoryReset.ps1 -DryRun                             # 사전 확인
+    .\MemoryReset.ps1 -Diagnose                           # 메모리 분석만
+    .\MemoryReset.ps1 -Deep                               # Tier A 추가
+    .\MemoryReset.ps1 -Deep -IncludeShell                 # Tier A + B
+    .\MemoryReset.ps1 -SkipConfirmation -KeepAlive        # 자동화
 
 .NOTES
-    관리자 권한 필요. 미보유 시 자동 elevation 시도.
+    관리자 권한 필요 (-DryRun / -Diagnose 제외). 미보유 시 자동 elevation 시도.
 #>
 
 [CmdletBinding()]
@@ -41,7 +56,12 @@ param(
     [int]$GracefulTimeoutSec = 8,
     [switch]$DryRun,
     [switch]$SkipConfirmation,
-    [switch]$KeepAlive
+    [switch]$KeepAlive,
+
+    # v1.1 추가 ─────────────────────────────────────────────
+    [switch]$Deep,           # Tier A: Memory Compression flush + System WS empty + 네트워크 캐시
+    [switch]$IncludeShell,   # Tier B: Explorer.exe + Windows Search 재시작 (Deep 와 함께 사용)
+    [switch]$Diagnose        # 회수 전 메모리 분포 상세 표시
 )
 
 $ErrorActionPreference = 'Continue'
@@ -57,14 +77,16 @@ function Test-IsAdmin {
 }
 
 if (-not (Test-IsAdmin)) {
-    if ($DryRun) {
-        # DryRun 은 destructive operation 없음 → 관리자 권한 불필요, 그대로 진행.
-        Write-Host "[i] DryRun 모드: 관리자 권한 없이 진행 (대상 표시만)" -ForegroundColor DarkGray
+    if ($DryRun -or $Diagnose) {
+        # DryRun / Diagnose 는 read-only → 관리자 권한 불필요, 그대로 진행
+        Write-Host "[i] 읽기 전용 모드: 관리자 권한 없이 진행" -ForegroundColor DarkGray
     } else {
         Write-Host "[!] 관리자 권한이 필요합니다. UAC 승격을 시도합니다..." -ForegroundColor Yellow
         $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
         if ($SkipConfirmation)  { $argList += '-SkipConfirmation' }
         if ($KeepAlive)         { $argList += '-KeepAlive' }
+        if ($Deep)              { $argList += '-Deep' }
+        if ($IncludeShell)      { $argList += '-IncludeShell' }
         if ($PSBoundParameters.ContainsKey('GracefulTimeoutSec')) {
             $argList += @('-GracefulTimeoutSec', $GracefulTimeoutSec)
         }
@@ -76,6 +98,12 @@ if (-not (Test-IsAdmin)) {
         }
         exit 0
     }
+}
+
+# IncludeShell 은 Deep 없이는 무의미 — 자동 활성화
+if ($IncludeShell -and -not $Deep) {
+    Write-Host "[i] -IncludeShell 단독 사용 — -Deep 도 자동 활성화" -ForegroundColor DarkGray
+    $Deep = $true
 }
 
 # ════════════════════════════════════════════════════════════════════
@@ -473,6 +501,201 @@ function Invoke-MemoryRecovery {
 }
 
 # ════════════════════════════════════════════════════════════════════
+# 6.5. -Diagnose: 회수 전 메모리 분포 상세 표시
+# ════════════════════════════════════════════════════════════════════
+function Show-MemoryDiagnostics {
+    Write-Host ""
+    Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor Magenta
+    Write-Host "║                메모리 진단 (Diagnostics)                  ║" -ForegroundColor Magenta
+    Write-Host "╚══════════════════════════════════════════════════════════╝" -ForegroundColor Magenta
+
+    # 1. PerfCounter 기반 메모리 리스트 분포
+    Write-Host ""
+    Write-Host "── 메모리 리스트 분포 ──" -ForegroundColor Cyan
+    try {
+        $counters = @(
+            '\Memory\Available MBytes',
+            '\Memory\Cache Bytes',
+            '\Memory\Modified Page List Bytes',
+            '\Memory\Standby Cache Normal Priority Bytes',
+            '\Memory\Standby Cache Reserve Bytes',
+            '\Memory\Standby Cache Core Bytes',
+            '\Memory\Free & Zero Page List Bytes'
+        )
+        $samples = (Get-Counter -Counter $counters -ErrorAction Stop).CounterSamples
+        foreach ($s in $samples) {
+            $name = ($s.Path -replace '.+\\Memory\\', '')
+            $val  = if ($name -eq 'Available MBytes') { '{0,8:N0} MB' -f $s.CookedValue }
+                    else { '{0,8:N0} MB' -f ($s.CookedValue / 1MB) }
+            Write-Host (" · {0,-44} {1}" -f $name, $val)
+        }
+    } catch {
+        Write-Host " [!] PerfCounter 조회 실패: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
+    # 2. Memory Compression Store
+    Write-Host ""
+    Write-Host "── Memory Compression Store ──" -ForegroundColor Cyan
+    try {
+        $mm = Get-MMAgent -ErrorAction Stop
+        Write-Host (" · MemoryCompression 활성화: {0}" -f $mm.MemoryCompression)
+        $compProc = Get-Process -Name 'Memory Compression' -ErrorAction SilentlyContinue
+        if ($compProc) {
+            $compMB = [math]::Round($compProc.WorkingSet64 / 1MB, 1)
+            Write-Host (" · 'Memory Compression' 프로세스 사용량: {0,8:N1} MB" -f $compMB) -ForegroundColor Yellow
+            Write-Host "   → -Deep 모드로 flush 가능"
+        } else {
+            Write-Host " · 'Memory Compression' 프로세스 정보 없음 (관리자 권한이거나 일부 빌드에서 숨겨짐)" -ForegroundColor DarkGray
+        }
+    } catch {
+        Write-Host " [!] MMAgent 조회 실패: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
+    # 3. 상위 점유 프로세스 Top 15 (working set 기준)
+    Write-Host ""
+    Write-Host "── 점유 상위 프로세스 Top 15 (Working Set 기준) ──" -ForegroundColor Cyan
+    Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 15 |
+        ForEach-Object {
+            $wsMB = [math]::Round($_.WorkingSet64 / 1MB, 1)
+            $cmMB = [math]::Round($_.PrivateMemorySize64 / 1MB, 1)
+            Write-Host (" · {0,-30} PID={1,-7} WS={2,8} MB  Commit={3,8} MB" -f $_.ProcessName, $_.Id, $wsMB, $cmMB)
+        }
+
+    # 4. 종료 대상 프로세스 카운트 (실제 회수 가능량 미리보기)
+    Write-Host ""
+    Write-Host "── 종료 대상 프로세스 (Claude/Antigravity) ──" -ForegroundColor Cyan
+    $targets = Get-TargetProcesses
+    if ($targets.Count -eq 0) {
+        Write-Host " (없음)" -ForegroundColor DarkGray
+    } else {
+        $tWS = [math]::Round((($targets | Measure-Object WorkingSetSize -Sum).Sum / 1MB), 1)
+        Write-Host (" · 총 {0} 개 프로세스 / Working Set 합계 {1:N1} MB 회수 가능" -f $targets.Count, $tWS)
+    }
+
+    Write-Host ""
+    Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor Magenta
+    Write-Host "║  진단 완료. 회수를 진행하려면 -Diagnose 없이 재실행.       ║" -ForegroundColor Magenta
+    Write-Host "╚══════════════════════════════════════════════════════════╝" -ForegroundColor Magenta
+}
+
+# ════════════════════════════════════════════════════════════════════
+# 7-A. Tier A: 깊은 회수 (-Deep)
+#      Memory Compression Store flush + System Working Set + 네트워크 캐시
+# ════════════════════════════════════════════════════════════════════
+function Invoke-DeepRecovery {
+    param([switch]$DryRun)
+
+    Write-Host ""
+    Write-Host "── [Deep] Tier A — 추가 회수 ──" -ForegroundColor Cyan
+
+    if ($DryRun) {
+        Write-Host " [DRY] MMAgent 재시작 / System WS / 네트워크 캐시 호출 예정" -ForegroundColor DarkGray
+        return
+    }
+
+    # A1. Memory Compression Store flush
+    #     원리: MemoryCompression 을 disable 했다가 다시 enable 하면 압축된 페이지가 해제됨
+    #     주의: 일시적으로 메모리 사용 spike 가능 (압축 해제 시) → standby 정리 후 호출하므로 여유 있음
+    Write-Host -NoNewline " · Memory Compression Store flush ..."
+    try {
+        $mm = Get-MMAgent -ErrorAction Stop
+        if ($mm.MemoryCompression) {
+            Disable-MMAgent -MemoryCompression -ErrorAction Stop
+            Start-Sleep -Milliseconds 800
+            Enable-MMAgent -MemoryCompression -ErrorAction Stop
+            Write-Host " [OK] (압축 페이지 해제됨)" -ForegroundColor Green
+        } else {
+            Write-Host " [skip] 이미 비활성화 상태" -ForegroundColor DarkGray
+        }
+    } catch {
+        Write-Host " [!] 실패: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
+    # A2. System-wide Working Set empty (NT 레벨 일괄)
+    #     6-1 의 per-process 루프와 별도로 system 프로세스까지 포함
+    Write-Host -NoNewline " · System Working Set empty (NT) ..."
+    $rcWs = [MemoryAPI]::InvokeMemoryListCommand([MemoryAPI]::MemoryEmptyWorkingSets)
+    if ($rcWs -eq 0) {
+        Write-Host " [OK]" -ForegroundColor Green
+    } else {
+        Write-Host (" [!] NTSTATUS={0}" -f (Format-NTStatus $rcWs)) -ForegroundColor Yellow
+    }
+
+    # A3. 네트워크 캐시 정리 (DNS / NetBIOS / ARP)
+    Write-Host -NoNewline " · DNS 캐시 ..."
+    try {
+        Clear-DnsClientCache -ErrorAction Stop
+        Write-Host " [OK]" -ForegroundColor Green
+    } catch {
+        Write-Host " [!] $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
+    Write-Host -NoNewline " · NetBIOS 캐시 ..."
+    $null = & nbtstat.exe -R 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host " [OK]" -ForegroundColor Green
+    } else {
+        Write-Host " [!] nbtstat exit=$LASTEXITCODE" -ForegroundColor DarkGray
+    }
+
+    Write-Host -NoNewline " · ARP 캐시 ..."
+    $null = & netsh.exe interface ip delete arpcache 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host " [OK]" -ForegroundColor Green
+    } else {
+        Write-Host " [!] netsh exit=$LASTEXITCODE" -ForegroundColor DarkGray
+    }
+}
+
+# ════════════════════════════════════════════════════════════════════
+# 7-B. Tier B: 셸 재시작 (-IncludeShell)
+#      Explorer.exe + Windows Search 재시작 — 200~500MB 추가 회수
+#      주의: 데스크톱이 1~2초 깜빡임, 열린 탐색기 창 닫힘
+# ════════════════════════════════════════════════════════════════════
+function Invoke-ShellRestart {
+    param([switch]$DryRun)
+
+    Write-Host ""
+    Write-Host "── [Deep+Shell] Tier B — 셸 재시작 ──" -ForegroundColor Cyan
+    Write-Host "  ! 데스크톱이 잠시 깜빡이며 열린 탐색기 창이 닫힙니다." -ForegroundColor Yellow
+
+    if ($DryRun) {
+        Write-Host " [DRY] explorer.exe + WSearch 재시작 예정" -ForegroundColor DarkGray
+        return
+    }
+
+    # B1. Explorer.exe 재시작
+    Write-Host -NoNewline " · Explorer 재시작 ..."
+    try {
+        $explorers = Get-Process -Name explorer -ErrorAction SilentlyContinue
+        $beforeMB = if ($explorers) { [math]::Round((($explorers | Measure-Object WorkingSet64 -Sum).Sum / 1MB), 1) } else { 0 }
+        $explorers | Stop-Process -Force -ErrorAction Stop
+        Start-Sleep -Milliseconds 1500
+        # Windows 가 자동으로 explorer 를 재시작하지 않는 경우 수동 시작
+        if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) {
+            Start-Process -FilePath explorer.exe
+        }
+        Write-Host (" [OK] (이전 사용량 {0} MB)" -f $beforeMB) -ForegroundColor Green
+    } catch {
+        Write-Host " [!] $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
+    # B2. Windows Search 서비스 재시작
+    Write-Host -NoNewline " · Windows Search 재시작 ..."
+    try {
+        $svc = Get-Service -Name WSearch -ErrorAction Stop
+        if ($svc.Status -eq 'Running') {
+            Restart-Service -Name WSearch -Force -ErrorAction Stop
+            Write-Host " [OK]" -ForegroundColor Green
+        } else {
+            Write-Host " [skip] 서비스가 실행 중이 아님 ($($svc.Status))" -ForegroundColor DarkGray
+        }
+    } catch {
+        Write-Host " [!] $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
+# ════════════════════════════════════════════════════════════════════
 # 8. Main
 # ════════════════════════════════════════════════════════════════════
 try { $Host.UI.RawUI.WindowTitle = 'Memory Reset — Claude Code & Antigravity' } catch {}
@@ -483,8 +706,20 @@ Write-Host "║      Memory Reset  —  Claude Code & Antigravity          ║" 
 Write-Host "║      (graceful kill + working-set + standby purge)       ║" -ForegroundColor Cyan
 Write-Host "╚══════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
 
-if ($DryRun) {
-    Write-Host "[i] DRY-RUN 모드 — 실제 종료/회수 없음" -ForegroundColor Magenta
+if ($DryRun)   { Write-Host "[i] DRY-RUN 모드 — 실제 종료/회수 없음" -ForegroundColor Magenta }
+if ($Diagnose) { Write-Host "[i] DIAGNOSE 모드 — 진단만 수행 (read-only)" -ForegroundColor Magenta }
+if ($Deep)     { Write-Host "[i] DEEP 모드 — Tier A (Memory Compression flush + System WS + 네트워크 캐시) 추가" -ForegroundColor Magenta }
+if ($IncludeShell) { Write-Host "[!] SHELL 재시작 모드 — 데스크톱이 잠시 깜빡입니다 (Tier B)" -ForegroundColor Yellow }
+
+# Diagnose 모드는 진단만 출력하고 종료
+if ($Diagnose) {
+    Show-MemoryDiagnostics
+    if (-not $KeepAlive) {
+        Write-Host ""
+        Write-Host "[i] 아무 키나 누르면 창이 닫힙니다."
+        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+    }
+    exit 0
 }
 
 $before = Show-MemoryStatus -Label "현재 메모리 상태"
@@ -557,6 +792,10 @@ if (-not $SkipConfirmation -and -not $DryRun -and $targets.Count -gt 0) {
 
 Stop-TargetProcesses -Processes $targets -TimeoutSec $GracefulTimeoutSec -DryRun:$DryRun
 Invoke-MemoryRecovery -DryRun:$DryRun
+
+# v1.1: 옵션 단계
+if ($Deep)         { Invoke-DeepRecovery -DryRun:$DryRun }
+if ($IncludeShell) { Invoke-ShellRestart -DryRun:$DryRun }
 
 $after = Show-MemoryStatus -Label "회수 후 메모리 상태"
 
