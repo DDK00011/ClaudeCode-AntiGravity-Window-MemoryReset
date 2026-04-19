@@ -65,8 +65,14 @@ Run.bat
 :: 3. 깊은 회수 [v1.1+] — Memory Compression flush + System WS + 네트워크 캐시
 Run-Deep.bat
 
-:: 진단만 [v1.1+] (UAC 불필요) — 메모리 분포/상위 점유 프로세스 보기
+:: 진단만 [v1.1+] — 메모리 분포/상위 점유 프로세스 보기
 Run-Diagnose.bat
+
+:: 트레이 데몬 시작 [v1.2+] — 시스템 트레이에 상주, 90% 도달 시 알림
+Tray.bat
+
+:: Windows 부팅 시 트레이 자동 시작 등록 (UAC 불필요)
+Tray-AutoStart-Register.bat
 ```
 
 또는 PowerShell 에서 직접:
@@ -147,13 +153,44 @@ Run-Diagnose.bat
 | 한글 깨짐 | 콘솔 폰트를 `Consolas` / `D2Coding` 등 유니코드 폰트로 변경 |
 | 스크립트가 안 뜸 | 파일이 차단됨 — 파일 우클릭 → 속성 → "차단 해제" 체크 |
 
+### 시스템 트레이 데몬 [v1.2+]
+
+```cmd
+Tray.bat                          :: 트레이 시작 (숨김 창)
+Tray-AutoStart-Register.bat       :: 부팅 시 자동 시작 등록
+Tray-AutoStart-Unregister.bat     :: 자동 시작 해제
+```
+
+- **항상 상주**: 시계 옆 알림 영역에 메모리 사용률 아이콘
+- **임계치 알림**: 메모리 사용률이 임계치 (기본 90%) 도달 시 BalloonTip — **자동 회수는 하지 않음** (사용자 결정 보장, 작업 손실 방지)
+- **우클릭 메뉴**: 기본/깊은/최대 회수 / 진단 / 드라이런 / 회수 이력 / 임계치 설정 / 종료
+- **단일 인스턴스**: mutex 로 중복 실행 방지
+- **설정 저장**: `tray-settings.json` (임계치/폴링 주기/쿨다운)
+- **데몬 자체는 관리자 권한 불필요** — 회수 트리거 시 UAC 자동 승격
+
+### 회수 이력 (CSV) [v1.2+]
+
+회수 실행 시마다 `recovery-history.csv` 에 자동 기록:
+
+| 컬럼 | 의미 |
+|------|------|
+| Timestamp | yyyy-MM-dd HH:mm:ss |
+| Mode | basic / deep / deep+shell |
+| BeforeFreeMB / AfterFreeMB | 회수 전/후 가용 MB |
+| RecoveredMB | 회수량 (음수 가능 — 다른 앱이 점유한 경우) |
+| BeforePctFree / AfterPctFree | 회수 전/후 가용 % |
+| ProcessesKilled | 종료된 Claude/Antigravity 프로세스 개수 |
+| RuntimeSec | 실행 소요 시간 |
+
+트레이 메뉴 → "회수 이력 보기" 로 Excel/메모장에서 열기. 어떤 모드가 본인 시스템에서 효과가 큰지 데이터 기반 판단 가능.
+
 ### 향후 개선 (Roadmap)
 
-- [ ] 시스템 트레이 GUI (C# WPF, NotifyIcon) — 가용 RAM 임계치 자동 트리거
-- [ ] 회수 이력 CSV 로깅 + 트렌드 차트
+- [ ] 트레이 아이콘 커스텀 디자인 (현재는 Windows 기본 아이콘)
+- [ ] 회수 이력 트렌드 차트 (PowerShell + Chart.js)
 - [ ] PID/제목 화이트리스트로 특정 세션만 살리는 옵션
-- [ ] 작업 스케줄러 통합 (예: 30분마다 자동 실행)
 - [ ] 영문 메시지 i18n
+- [ ] CI: PSScriptAnalyzer + 자동 PARSE 검증
 
 ### 기여 / 보안 보고
 

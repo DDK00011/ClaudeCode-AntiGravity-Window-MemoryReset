@@ -749,9 +749,54 @@ function Invoke-ShellRestart {
 }
 
 # ════════════════════════════════════════════════════════════════════
+# 7-C. CSV 회수 이력 로깅
+# ════════════════════════════════════════════════════════════════════
+function Write-RecoveryLog {
+    param(
+        [string]$Mode,
+        [int]$BeforeFreeMB,
+        [int]$AfterFreeMB,
+        [double]$BeforePctFree,
+        [double]$AfterPctFree,
+        [int]$ProcessesKilled,
+        [double]$RuntimeSec
+    )
+
+    $logPath = Join-Path $PSScriptRoot 'recovery-history.csv'
+    $isNew   = -not (Test-Path $logPath)
+
+    $row = [PSCustomObject]@{
+        Timestamp        = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        Mode             = $Mode
+        BeforeFreeMB     = $BeforeFreeMB
+        AfterFreeMB      = $AfterFreeMB
+        RecoveredMB      = $AfterFreeMB - $BeforeFreeMB
+        BeforePctFree    = $BeforePctFree
+        AfterPctFree     = $AfterPctFree
+        RecoveredPctP    = [math]::Round($AfterPctFree - $BeforePctFree, 2)
+        ProcessesKilled  = $ProcessesKilled
+        RuntimeSec       = [math]::Round($RuntimeSec, 1)
+    }
+
+    try {
+        if ($isNew) {
+            $row | Export-Csv -Path $logPath -NoTypeInformation -Encoding UTF8
+        } else {
+            $row | Export-Csv -Path $logPath -NoTypeInformation -Encoding UTF8 -Append
+        }
+    } catch {
+        # 로깅 실패는 회수 자체에 영향 없음 — 조용히 경고만
+        Write-Host " [!] CSV 로그 기록 실패: $($_.Exception.Message)" -ForegroundColor DarkYellow
+    }
+}
+
+# ════════════════════════════════════════════════════════════════════
 # 8. Main
 # ════════════════════════════════════════════════════════════════════
 try { $Host.UI.RawUI.WindowTitle = 'Memory Reset — Claude Code & Antigravity' } catch {}
+
+# 실행 시간 측정 시작
+$script:startTime = Get-Date
 
 Clear-Host
 Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
@@ -860,6 +905,21 @@ if (-not $DryRun) {
     Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
     Write-Host (" 회수된 RAM: {0}{1:N0} MB   ({2}{3:N1}%p)" -f $sign, $recovered, $sign, $pctChange) -ForegroundColor Green
     Write-Host "╚══════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+
+    # CSV 회수 이력 기록 (v1.2+)
+    $modeTag = if ($Deep -and $IncludeShell) { 'deep+shell' }
+               elseif ($Deep)                { 'deep' }
+               else                          { 'basic' }
+    $elapsed = ((Get-Date) - $script:startTime).TotalSeconds
+    Write-RecoveryLog `
+        -Mode             $modeTag `
+        -BeforeFreeMB     $before.FreeMB `
+        -AfterFreeMB      $after.FreeMB `
+        -BeforePctFree    $before.PctFree `
+        -AfterPctFree     $after.PctFree `
+        -ProcessesKilled  $targets.Count `
+        -RuntimeSec       $elapsed
+    Write-Host (" [i] 회수 이력 기록: recovery-history.csv (실행 {0:N1} 초)" -f $elapsed) -ForegroundColor DarkGray
 }
 
 if (-not $KeepAlive) {
