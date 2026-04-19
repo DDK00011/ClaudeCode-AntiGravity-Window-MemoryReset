@@ -73,3 +73,61 @@ if ($null -eq $selfIncluded) {
 } else {
     Write-Host "[FAIL] 자기 자신이 대상에 포함됨!" -ForegroundColor Red
 }
+
+# v1.1 신규 기능 smoke test
+Write-Host ""
+Write-Host "== v1.1 신규 함수/플래그 smoke test =="
+
+# 1. 신규 함수가 스크립트에 정의되어 있는지 확인
+$expectedFunctions = @('Show-MemoryDiagnostics', 'Invoke-DeepRecovery', 'Invoke-ShellRestart')
+foreach ($fn in $expectedFunctions) {
+    if ($src -match "(?ms)^function\s+$fn\b") {
+        Write-Host "[PASS] 함수 정의 존재: $fn" -ForegroundColor Green
+    } else {
+        Write-Host "[FAIL] 함수 정의 누락: $fn" -ForegroundColor Red
+    }
+}
+
+# 2. 신규 파라미터 선언 확인
+$expectedParams = @('Deep', 'IncludeShell', 'Diagnose')
+foreach ($p in $expectedParams) {
+    $pattern = '\[switch\]\$' + $p + '\b'
+    if ($src -match $pattern) {
+        Write-Host "[PASS] 파라미터 정의: -$p" -ForegroundColor Green
+    } else {
+        Write-Host "[FAIL] 파라미터 누락: -$p" -ForegroundColor Red
+    }
+}
+
+# 3. v1.1.1 안전 가드 검증 (Round 1 패치 추적)
+if ($src -match 'finally\s*\{[\s\S]*?Enable-MMAgent') {
+    Write-Host "[PASS] MMAgent Disable→Enable try/finally 가드 존재" -ForegroundColor Green
+} else {
+    Write-Host "[WARN] MMAgent try/finally 가드 미확인 — Disable 후 Enable 실패 시 시스템 압축 영구 비활성화 위험" -ForegroundColor Yellow
+}
+
+if ($src -match 'availMB\s*-lt\s*1024') {
+    Write-Host "[PASS] 압축 해제 spike OOM 가드 존재 (가용 RAM < 1GB 시 skip)" -ForegroundColor Green
+} else {
+    Write-Host "[WARN] OOM 가드 미확인" -ForegroundColor Yellow
+}
+
+if ($src -match 'restartedByWindows\s*=\s*\$true') {
+    Write-Host "[PASS] Explorer 재시작 폴링 루프 존재" -ForegroundColor Green
+} else {
+    Write-Host "[WARN] Explorer 폴링 루프 미확인 — 셸 확장 많은 시스템에서 1.5초 부족 가능" -ForegroundColor Yellow
+}
+
+# 6. v1.1.2 elevation safety: Explorer 자동 재시작에만 의존 (Round 2 패치)
+if ($src -match '의도적으로\s*elevated\s*explorer\.exe\s*직접\s*실행하지\s*않음') {
+    Write-Host "[PASS] Explorer elevation 위험 회피 (자동 재시작 전용)" -ForegroundColor Green
+} else {
+    Write-Host "[WARN] elevated explorer 자동 시작 가드 미확인 — 일반 앱이 권한 부족 겪을 위험" -ForegroundColor Yellow
+}
+
+# 7. v1.1.2 MMAgent sleep 1500ms (Round 2 패치)
+if ($src -match 'Start-Sleep\s+-Milliseconds\s+1500') {
+    Write-Host "[PASS] MMAgent decompress 대기 1500ms (이전 800ms 에서 증가)" -ForegroundColor Green
+} else {
+    Write-Host "[WARN] MMAgent sleep 1500ms 미확인" -ForegroundColor Yellow
+}

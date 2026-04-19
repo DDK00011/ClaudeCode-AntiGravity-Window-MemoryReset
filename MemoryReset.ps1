@@ -545,7 +545,10 @@ function Show-MemoryDiagnostics {
             Write-Host (" · 'Memory Compression' 프로세스 사용량: {0,8:N1} MB" -f $compMB) -ForegroundColor Yellow
             Write-Host "   → -Deep 모드로 flush 가능"
         } else {
-            Write-Host " · 'Memory Compression' 프로세스 정보 없음 (관리자 권한이거나 일부 빌드에서 숨겨짐)" -ForegroundColor DarkGray
+            # "Memory Compression" 은 보호된 시스템 프로세스 — 관리자 권한 없으면 enumerate 실패가 정상
+            $hint = if (Test-IsAdmin) { '일부 Windows 빌드에서 숨겨진 시스템 프로세스' }
+                    else              { '관리자 권한 필요 (현재 read-only 모드)' }
+            Write-Host " · 'Memory Compression' 프로세스 직접 측정 불가 ($hint)" -ForegroundColor DarkGray
         }
     } catch {
         Write-Host " [!] MMAgent 조회 실패: $($_.Exception.Message)" -ForegroundColor Yellow
@@ -595,24 +598,50 @@ function Invoke-DeepRecovery {
 
     # A1. Memory Compression Store flush
     #     원리: MemoryCompression 을 disable 했다가 다시 enable 하면 압축된 페이지가 해제됨
-    #     주의: 일시적으로 메모리 사용 spike 가능 (압축 해제 시) → standby 정리 후 호출하므로 여유 있음
+    #     주의 1: 압축 해제 시 일시적 메모리 spike → 가용 RAM < 1GB 면 skip (OOM 방지)
+    #     주의 2: Disable 성공 후 Enable 실패 시 시스템에 압축 기능 영구 비활성화 → try/finally 필수
     Write-Host -NoNewline " · Memory Compression Store flush ..."
     try {
         $mm = Get-MMAgent -ErrorAction Stop
-        if ($mm.MemoryCompression) {
-            Disable-MMAgent -MemoryCompression -ErrorAction Stop
-            Start-Sleep -Milliseconds 800
-            Enable-MMAgent -MemoryCompression -ErrorAction Stop
-            Write-Host " [OK] (압축 페이지 해제됨)" -ForegroundColor Green
-        } else {
+        if (-not $mm.MemoryCompression) {
             Write-Host " [skip] 이미 비활성화 상태" -ForegroundColor DarkGray
+        } else {
+            # 안전 가드: 가용 메모리 1GB 미만이면 압축 해제 spike 위험
+            $os = Get-CimInstance Win32_OperatingSystem
+            $availMB = [math]::Round($os.FreePhysicalMemory / 1024)
+            if ($availMB -lt 1024) {
+                Write-Host (" [skip] 가용 RAM 부족 ({0} MB < 1024 MB) — 압축 해제 spike 위험" -f $availMB) -ForegroundColor Yellow
+            } else {
+                $disabled = $false
+                try {
+                    Disable-MMAgent -MemoryCompression -ErrorAction Stop
+                    $disabled = $true
+                    # Decompress 백그라운드 작업 대기 — GB 단위 store 면 짧을 수 있으나 1500ms 가 합리적 균형
+                    Start-Sleep -Milliseconds 1500
+                } finally {
+                    # CRITICAL: Disable 후 어떤 일이 있어도 Enable 보장 (시스템 보호)
+                    if ($disabled) {
+                        try {
+                            Enable-MMAgent -MemoryCompression -ErrorAction Stop
+                            Write-Host " [OK] (압축 페이지 해제됨)" -ForegroundColor Green
+                        } catch {
+                            # 이중 실패 — 사용자에게 강력히 알림
+                            Write-Host ""
+                            Write-Host " [CRITICAL] MemoryCompression Re-Enable 실패!" -ForegroundColor Red
+                            Write-Host "   수동 복구 필요: PowerShell 관리자 권한으로 'Enable-MMAgent -MemoryCompression' 실행" -ForegroundColor Red
+                            Write-Host "   또는 PC 재부팅 시 자동 복구됨" -ForegroundColor Yellow
+                        }
+                    }
+                }
+            }
         }
     } catch {
         Write-Host " [!] 실패: $($_.Exception.Message)" -ForegroundColor Yellow
     }
 
     # A2. System-wide Working Set empty (NT 레벨 일괄)
-    #     6-1 의 per-process 루프와 별도로 system 프로세스까지 포함
+    #     6-1 의 per-process 루프(PROCESS_SET_QUOTA 권한 부족으로 보호 프로세스 skip 됨)를
+    #     커널 모드에서 보완. RAMMap 의 "Empty Working Sets" 와 동일 동작.
     Write-Host -NoNewline " · System Working Set empty (NT) ..."
     $rcWs = [MemoryAPI]::InvokeMemoryListCommand([MemoryAPI]::MemoryEmptyWorkingSets)
     if ($rcWs -eq 0) {
@@ -665,17 +694,38 @@ function Invoke-ShellRestart {
     }
 
     # B1. Explorer.exe 재시작
+    #     주의 1: 셸 확장이 많은 시스템은 재시작에 5초+ 소요됨 → 최대 15초 폴링
+    #     주의 2: 관리자 PS 에서 Start-Process explorer 하면 explorer 가 elevated 컨텍스트로 시작되어
+    #             일반 앱(드래그앤드롭, IME 등)이 권한 부족 겪을 수 있음.
+    #             따라서 Windows 의 자동 셸 재시작(winlogon 이 user token 으로 시작)에만 의존.
+    #             자동 재시작 실패 시 수동 시작 안 하고 사용자에게 가이드만 표시.
     Write-Host -NoNewline " · Explorer 재시작 ..."
     try {
         $explorers = Get-Process -Name explorer -ErrorAction SilentlyContinue
         $beforeMB = if ($explorers) { [math]::Round((($explorers | Measure-Object WorkingSet64 -Sum).Sum / 1MB), 1) } else { 0 }
-        $explorers | Stop-Process -Force -ErrorAction Stop
-        Start-Sleep -Milliseconds 1500
-        # Windows 가 자동으로 explorer 를 재시작하지 않는 경우 수동 시작
-        if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) {
-            Start-Process -FilePath explorer.exe
+        if ($explorers) {
+            $explorers | Stop-Process -Force -ErrorAction Stop
         }
-        Write-Host (" [OK] (이전 사용량 {0} MB)" -f $beforeMB) -ForegroundColor Green
+
+        # Windows 의 자동 셸 재시작 polling (최대 15초 대기)
+        $restartedByWindows = $false
+        for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Milliseconds 500
+            if (Get-Process -Name explorer -ErrorAction SilentlyContinue) {
+                $restartedByWindows = $true
+                break
+            }
+        }
+
+        if ($restartedByWindows) {
+            Write-Host (" [OK] Windows 자동 재시작 완료 (이전 사용량 {0} MB)" -f $beforeMB) -ForegroundColor Green
+        } else {
+            # 의도적으로 elevated explorer.exe 직접 실행하지 않음 (권한 컨텍스트 오염 방지).
+            # 사용자에게 안전한 복구 방법 안내.
+            Write-Host (" [!] Windows 가 자동 재시작 못함 (이전 사용량 {0} MB)" -f $beforeMB) -ForegroundColor Yellow
+            Write-Host "   → Ctrl+Shift+Esc → 작업관리자 → 파일 → '새 작업 실행' → explorer 입력 (관리자 체크 해제)" -ForegroundColor DarkYellow
+            Write-Host "   → 또는 로그오프/재로그인" -ForegroundColor DarkYellow
+        }
     } catch {
         Write-Host " [!] $($_.Exception.Message)" -ForegroundColor Yellow
     }
